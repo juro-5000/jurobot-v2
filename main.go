@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -344,32 +343,6 @@ func main() {
 				// Ensure it goes to the real stdout after TUI/Loading screen restore
 				fmt.Println("spawned; ready")
 				c.Logger.Println("spawned; ready")
-
-				// Auto-stop cloud bot if cloud_tunnel is enabled
-				if appCfg.CloudTunnel.Enabled && appCfg.CloudTunnel.APIToken != "" && appCfg.CloudTunnel.HealthURL != "" {
-					go func() {
-						time.Sleep(3 * time.Second)
-						url := appCfg.CloudTunnel.HealthURL + "/api/stop-cloud"
-						req, err := http.NewRequest("POST", url, nil)
-						if err != nil {
-							c.Logger.Printf("[CLOUD] Auto-stop: failed to create request: %v", err)
-							return
-						}
-						req.Header.Set("Authorization", "Bearer "+appCfg.CloudTunnel.APIToken)
-						client := &http.Client{Timeout: 10 * time.Second}
-						resp, err := client.Do(req)
-						if err != nil {
-							c.Logger.Printf("[CLOUD] Auto-stop: failed to ping cloud: %v", err)
-							return
-						}
-						defer resp.Body.Close()
-						if resp.StatusCode == 200 {
-							c.Logger.Printf("[CLOUD] Auto-stopped cloud bot")
-						} else {
-							c.Logger.Printf("[CLOUD] Auto-stop: cloud returned status %d", resp.StatusCode)
-						}
-					}()
-				}
 
 				if f.Timeout > 0 {
 					time.AfterFunc(time.Duration(f.Timeout)*time.Second, func() {
@@ -1049,13 +1022,6 @@ func startHeadlessAPI(c *client.Client, f *helpers.Flags, h *CommandHandler, sor
 	})
 
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
-		if appCfg.CloudTunnel.APIToken != "" {
-			authHeader := r.Header.Get("Authorization")
-			if authHeader != "Bearer "+appCfg.CloudTunnel.APIToken {
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
-				return
-			}
-		}
 		w.Header().Set("Content-Type", "application/json")
 		if c.State() == jp.StatePlay {
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1069,53 +1035,6 @@ func startHeadlessAPI(c *client.Client, f *helpers.Flags, h *CommandHandler, sor
 				"active": false,
 			})
 		}
-	})
-
-	http.HandleFunc("/api/stop-cloud", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !appCfg.CloudTunnel.Enabled {
-			http.Error(w, "Cloud tunnel not enabled", http.StatusForbidden)
-			return
-		}
-		authHeader := r.Header.Get("Authorization")
-		if authHeader != "Bearer "+appCfg.CloudTunnel.APIToken {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		repo := appCfg.CloudTunnel.GitHubRepo
-		if repo == "" {
-			repo = "juro-5000/jurobot-v2"
-		}
-
-		go func() {
-			// Find the latest running workflow run and cancel it
-			cmd := fmt.Sprintf("gh run list --repo %s --workflow=run-bot.yml --status=in_progress --limit=1 --json databaseId --jq '.[0].databaseId'", repo)
-			output, err := exec.Command("bash", "-c", cmd).Output()
-			if err != nil {
-				c.Logger.Printf("[CLOUD] Failed to list runs: %v", err)
-				return
-			}
-			runID := strings.TrimSpace(string(output))
-			if runID == "" || runID == "null" {
-				c.Logger.Printf("[CLOUD] No active cloud run found to stop")
-				return
-			}
-			cancelCmd := fmt.Sprintf("gh run cancel %s --repo %s", runID, repo)
-			if output, err := exec.Command("bash", "-c", cancelCmd).CombinedOutput(); err != nil {
-				c.Logger.Printf("[CLOUD] Failed to cancel run %s: %v — %s", runID, err, string(output))
-			} else {
-				c.Logger.Printf("[CLOUD] Stopped cloud run %s", runID)
-			}
-		}()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": true,
-		})
 	})
 
 	http.HandleFunc("/ws", handleWS(c))
@@ -1144,21 +1063,15 @@ func startHeadlessAPI(c *client.Client, f *helpers.Flags, h *CommandHandler, sor
 	})
 
 	go func() {
-		port := 5050
-		for ; port <= 5060; port++ {
-			addr := fmt.Sprintf(":%d", port)
-			l, err := net.Listen("tcp", addr)
-			if err == nil {
-				if port != 5050 {
-					c.Logger.Printf("port 5050 in use, using %s instead", addr)
-				}
-				if err := http.Serve(l, nil); err != nil {
-					c.Logger.Printf("API Server error on %s: %v", addr, err)
-				}
-				return
-			}
+		l, err := net.Listen("tcp", "127.0.0.1:3000")
+		if err != nil {
+			c.Logger.Printf("API server error: %v", err)
+			return
 		}
-		c.Logger.Printf("failed to start API server: no free port found in range 3000-3010")
+		c.Logger.Printf("API server on 127.0.0.1:3000")
+		if err := http.Serve(l, nil); err != nil {
+			c.Logger.Printf("API server error: %v", err)
+		}
 	}()
 }
 

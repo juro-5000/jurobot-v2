@@ -786,7 +786,267 @@ func startHeadlessAPI(c *client.Client, f *helpers.Flags, h *CommandHandler, sor
 		}
 	})
 
+	http.HandleFunc("/api/clear", func(w http.ResponseWriter, r *http.Request) {
+		logsMu.Lock()
+		consoleLogs = nil
+		logsMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	})
 
+	http.HandleFunc("/panel", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!DOCTYPE html><html><head><title>JuroBot Panel v2.1</title><style>`+WebCSS+`</style></head><body>
+			<div style="margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;">
+				<h1 style="margin:0; color:#4caf50;">JuroBot <span style="font-size:0.5em; color:#666;">v2.1</span></h1>
+				<button onclick="clearLogs()" style="background:#f44336;">Clear Logs</button>
+			</div>
+			<div class="tab-container">
+				<div class="tabs">
+					<div class="tab active" onclick="showTab('status')">Status</div>
+					<div class="tab" onclick="showTab('inventory')">Inventory</div>
+					<div class="tab" onclick="showTab('logs')">Logs</div>
+				</div>
+				<div class="content">
+					<div id="status" class="tab-content active"><h3>System Status</h3><pre id="status-data">Loading...</pre></div>
+					<div id="inventory" class="tab-content"><h3>Inventory</h3><pre id="inventory-data">Loading...</pre></div>
+					<div id="logs" class="tab-content">
+						<h3>Live Logs</h3>
+						<pre id="logs-data" style="max-height: 500px; overflow-y:auto; background:#000; color:#eee;"></pre>
+						<div class="controls">
+							<input type="text" id="chat-input" placeholder="Type a message or command...">
+							<button onclick="sendChat()">Send</button>
+						</div>
+					</div>
+				</div>
+			</div>
+			<script>
+				let currentTab = 'status';
+				function showTab(id) {
+					currentTab = id;
+					document.querySelectorAll('.tab, .tab-content').forEach(el => el.classList.remove('active'));
+					document.querySelector('.tab[onclick*="'+id+'"]').classList.add('active');
+					document.getElementById(id).classList.add('active');
+					update(true);
+				}
+				function update(force) {
+					fetch('/'+currentTab+'?format=html&v='+Date.now()).then(r => r.text()).then(html => {
+						const el = document.getElementById(currentTab+'-data');
+						el.innerHTML = html;
+						if(currentTab === 'logs') el.scrollTop = el.scrollHeight;
+					});
+				}
+				function sendChat() {
+					const input = document.getElementById('chat-input');
+					if(!input.value) return;
+					fetch('/say?msg=' + encodeURIComponent(input.value)).then(() => { input.value = ''; update(); });
+				}
+				function clearLogs() {
+					if(confirm('Clear all logs?')) fetch('/api/clear').then(() => update());
+				}
+				setInterval(() => update(false), 2000);
+				update(true);
+				document.getElementById('chat-input').onkeydown = e => { if(e.key === 'Enter') sendChat(); };
+			</script>
+		</body></html>`)
+	})
+
+	http.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		isHTML := r.URL.Query().Get("format") == "html" || strings.Contains(r.Header.Get("Accept"), "text/html")
+
+		if !isHTML {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			logsMu.RLock()
+			defer logsMu.RUnlock()
+			for _, entry := range consoleLogs {
+				fmt.Fprintln(w, entry.Message)
+			}
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if !strings.Contains(r.Header.Get("Referer"), "/panel") {
+			fmt.Fprint(w, "<html><head><title>Logs</title><style>"+WebCSS+"</style></head><body>")
+		}
+
+		logsMu.RLock()
+		defer logsMu.RUnlock()
+		for _, entry := range consoleLogs {
+			t, _ := time.Parse(time.RFC3339, entry.Time)
+			fmt.Fprintf(w, "<div class=\"line\"><span class=\"ts\">[%s]</span>%s</div>",
+				t.Format("15:04:05"), ansiToHTML(entry.Message))
+		}
+
+		if !strings.Contains(r.Header.Get("Referer"), "/panel") {
+			fmt.Fprint(w, "</body></html>")
+		}
+	})
+
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		s := self.From(c)
+		plist := playerlist.From(c)
+		x, y, z := s.Position()
+		health := s.Health()
+		food := s.Food()
+		uptime := time.Since(startTime)
+		ping := int32(0)
+		if plist != nil {
+			if p := plist.GetPlayerByName(c.Username); p != nil {
+				ping = p.Ping
+			}
+		}
+
+		if r.URL.Query().Get("format") == "html" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			statusStr := "OFFLINE"
+			if c.State() == jp.StatePlay {
+				statusStr = "ONLINE"
+			}
+			fmt.Fprintf(w, "<b>Status:</b> <span style=\"color:#4caf50\">%s</span>\n", statusStr)
+			fmt.Fprintf(w, "<b>Username:</b> %s\n", c.Username)
+			fmt.Fprintf(w, "<b>Ping:</b> %dms\n", ping)
+			fmt.Fprintf(w, "<b>Health:</b> %.1f\n", health)
+			fmt.Fprintf(w, "<b>Food:</b> %d\n", food)
+			fmt.Fprintf(w, "<b>Pos:</b> %.1f, %.1f, %.1f\n", x, y, z)
+			fmt.Fprintf(w, "<b>Uptime:</b> %s\n", uptime.Round(time.Second))
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintf(w, "Username: %s | Ping: %dms | Health: %.1f | Pos: %.1f,%.1f,%.1f\n", c.Username, ping, health, x, y, z)
+	})
+
+	http.HandleFunc("/inventory", func(w http.ResponseWriter, r *http.Request) {
+		inv := inventory.From(c)
+		if inv == nil {
+			fmt.Fprintln(w, "Empty")
+			return
+		}
+
+		if r.URL.Query().Get("format") == "html" {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			found := false
+			for i := inventory.SlotMainStart; i < inventory.SlotHotbarEnd; i++ {
+				item := inv.GetSlot(i)
+				if item != nil && !item.IsEmpty() {
+					fmt.Fprintf(w, "<div><b>%s</b> x%d</div>", items.ItemName(item.ID), item.Count)
+					found = true
+				}
+			}
+			if !found {
+				fmt.Fprint(w, "<i>Empty</i>")
+			}
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		found := false
+		for i := inventory.SlotMainStart; i < inventory.SlotHotbarEnd; i++ {
+			item := inv.GetSlot(i)
+			if item != nil && !item.IsEmpty() {
+				fmt.Fprintf(w, "[%s] %dx\n", items.ItemName(item.ID), item.Count)
+				found = true
+			}
+		}
+		if !found {
+			fmt.Fprintln(w, "Empty")
+		}
+	})
+
+	http.HandleFunc("/say", func(w http.ResponseWriter, r *http.Request) {
+		msg := r.URL.Query().Get("msg")
+		user := r.URL.Query().Get("user")
+		if msg != "" {
+			if user != "" {
+				modchat.From(c).SendWhisper(user, msg)
+				fmt.Fprintf(w, "Whisper sent to %s: [%s]\n", user, msg)
+			} else {
+				modchat.From(c).SendMessage(msg)
+				fmt.Fprintf(w, "Message sent: [%s]\n", msg)
+			}
+		} else {
+			fmt.Fprintln(w, "Error: No msg parameter")
+		}
+	})
+
+	http.HandleFunc("/whisper", func(w http.ResponseWriter, r *http.Request) {
+		user := r.URL.Query().Get("user")
+		msg := r.URL.Query().Get("msg")
+		if user != "" && msg != "" {
+			modchat.From(c).SendWhisper(user, msg)
+			fmt.Fprintf(w, "Whisper sent to %s: [%s]\n", user, msg)
+		} else {
+			fmt.Fprintln(w, "Error: Missing user or msg parameter")
+		}
+	})
+
+	http.HandleFunc("/api/forcepearl", func(w http.ResponseWriter, r *http.Request) {
+		user := r.URL.Query().Get("user")
+		if user == "" {
+			http.Error(w, "Missing user parameter", http.StatusBadRequest)
+			return
+		}
+		cmd := &commands.ForcePearlCommand{}
+		cmd.Execute(&commands.Context{
+			Client:  c,
+			Sender:  "[api]",
+			Message: ".forcepearl " + user,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	})
+
+	http.HandleFunc("/api/pull", func(w http.ResponseWriter, r *http.Request) {
+		user := r.URL.Query().Get("user")
+		if user == "" {
+			http.Error(w, "Missing user parameter", http.StatusBadRequest)
+			return
+		}
+		cmd := &commands.PullCommand{}
+		cmd.Execute(&commands.Context{
+			Client:  c,
+			Sender:  user,
+			Message: "*pull",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	})
+
+	http.HandleFunc("/api/echest", func(w http.ResponseWriter, r *http.Request) {
+		cmd := &commands.EchestCommand{}
+		cmd.Execute(&commands.Context{
+			Client:  c,
+			Sender:  "[api]",
+			Message: ".echest",
+		})
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	})
+
+	http.HandleFunc("/api/command", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var body struct {
+			Command string `json:"command"`
+			Type    string `json:"type"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "Bad request", http.StatusBadRequest)
+			return
+		}
+		switch body.Command {
+		case "drop", "keeplist", "forcekeeplist":
+			go sorter.RunSortingRoutine(c)
+		case "rotate":
+			s := self.From(c)
+			y, p := s.Rotation()
+			s.SetRotation(float64(y+90), float64(p))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"success": true})
+	})
 
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		if appCfg.CloudTunnel.APIToken != "" {
@@ -856,6 +1116,31 @@ func startHeadlessAPI(c *client.Client, f *helpers.Flags, h *CommandHandler, sor
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success": true,
 		})
+	})
+
+	http.HandleFunc("/ws", handleWS(c))
+	http.HandleFunc("/apis", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		endpoints := []string{
+			"/panel - Web UI Panel",
+			"/ws - WebSocket endpoint for remote control mode",
+			"/status - Current bot status",
+			"/logs - Live logs (append ?format=html for styled)",
+			"/inventory - Current inventory (append ?format=html for styled)",
+			"/say?msg=<text>&user=<optional_target> - Send message or whisper",
+			"/whisper?user=<target>&msg=<text> - Send a whisper",
+			"/api/health - Health check (active/inactive)",
+			"/api/stop-cloud - Stop GitHub Actions cloud bot (POST, Bearer token)",
+			"/api/forcepearl?user=<target> - Force pull a specific user's pearl",
+			"/api/pull?user=<sender> - Trigger a pull command as a user",
+			"/api/echest - Open nearest ender chest and list contents",
+			"/api/clear - Clear log buffer",
+			"/api/command - Execute internal bot commands (POST)",
+			"/apis - This list",
+		}
+		for _, e := range endpoints {
+			fmt.Fprintln(w, e)
+		}
 	})
 
 	go func() {
@@ -951,6 +1236,25 @@ func Colorize(c *client.Client, comp interface{}) string {
 	final := result + ColorReset
 	return chat.ReplaceWaypoints(final)
 }
+
+const WebCSS = `
+	body { background: #121212; color: #e0e0e0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; }
+	pre { background: #000; padding: 15px; border-radius: 5px; overflow-x: auto; white-space: pre-wrap; font-family: Consolas, monospace; border: 1px solid #333; }
+	.line { margin-bottom: 2px; }
+	.ts { color: #666; margin-right: 8px; }
+	.tab-container { background: #1f1f1f; border: 1px solid #333; border-radius: 8px; overflow: hidden; }
+	.tabs { display: flex; background: #1f1f1f; border-bottom: 1px solid #333; }
+	.tab { padding: 12px 20px; cursor: pointer; border-bottom: 3px solid transparent; transition: 0.2s; color: #aaa; }
+	.tab:hover { background: #2a2a2a; color: #fff; }
+	.tab.active { border-bottom-color: #4caf50; background: #2a2a2a; color: #fff; }
+	.content { padding: 20px; }
+	.tab-content { display: none; }
+	.tab-content.active { display: block; }
+	.controls { margin-top: 15px; display: flex; gap: 10px; }
+	input { background: #333; border: 1px solid #444; color: #fff; padding: 10px; border-radius: 4px; flex-grow: 1; }
+	button { background: #4caf50; border: none; color: #fff; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; }
+	button:hover { background: #45a049; }
+`
 
 var trueColorRegex = regexp.MustCompile(`\x1b\[38;2;(\d+);(\d+);(\d+)m`)
 

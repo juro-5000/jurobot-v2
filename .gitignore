@@ -1,0 +1,5 @@
+secrets.md
+*.key
+*.pem
+credentials.json
+tunnel-credentials.json

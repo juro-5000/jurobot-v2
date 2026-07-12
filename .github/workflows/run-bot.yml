@@ -1,0 +1,140 @@
+name: Run Bot
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'Run duration in hours (max 6)'
+        required: true
+        default: '6'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+
+env:
+  BOT_DURATION: ${{ github.event.inputs.duration || '6' }}
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - name: Check local bot health
+        id: health
+        run: |
+          HEALTH_URL="${{ secrets.HEALTH_URL }}"
+          if [ -z "$HEALTH_URL" ]; then
+            echo "No health URL configured, proceeding"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          API_TOKEN="${{ secrets.API_TOKEN }}"
+          echo "Checking local bot at $HEALTH_URL ..."
+          RESPONSE=$(curl -s --max-time 10 -H "Authorization: Bearer $API_TOKEN" "$HEALTH_URL/api/health" || echo "")
+          if echo "$RESPONSE" | grep -q '"active":true'; then
+            echo "Local bot is ACTIVE — skipping cloud run"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Local bot is inactive — proceeding with cloud run"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.health.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        if: steps.health.outputs.skip != 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Download dependencies
+        if: steps.health.outputs.skip != 'true'
+        run: go mod download
+
+      - name: Build bot
+        if: steps.health.outputs.skip != 'true'
+        run: go build -ldflags="-s -w" -o jurobot .
+
+      - name: Create config
+        if: steps.health.outputs.skip != 'true'
+        env:
+          SERVER_ADDRESS: ${{ secrets.SERVER_ADDRESS }}
+          SERVER_PORT: ${{ secrets.SERVER_PORT || '25565' }}
+          BOT_USERNAME: ${{ secrets.BOT_USERNAME }}
+          REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+        run: |
+          python3 -c "
+          import json, os
+          cfg = {
+              'server': {'address': os.environ['SERVER_ADDRESS'], 'port': int(os.environ['SERVER_PORT'])},
+              'debug': {'enabled': False, 'show_chat_packets': True, 'show_raw_hex': False, 'show_json': True},
+              'translation': {'enabled': True, 'target_lang': 'en', 'verbose': False},
+              'sorter': {'auto_echest': True},
+              'combat': {'auto_eat': True, 'auto_totem': True, 'auto_armor': True},
+              'keepalive': {'enabled': True, 'health_threshold': 10, 'void_y_threshold': -50},
+              'account': {'username': os.environ['BOT_USERNAME'], 'refresh_token': os.environ['REFRESH_TOKEN']},
+              'cloud_tunnel': {'enabled': True, 'api_token': os.environ['API_TOKEN'], 'github_repo': 'juro-5000/jurobot-v2'}
+          }
+          with open('config.json', 'w') as f:
+              json.dump(cfg, f, indent=2)
+          "
+
+      - name: Install cloudflared
+        if: steps.health.outputs.skip != 'true'
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Start cloudflared tunnel
+        if: steps.health.outputs.skip != 'true'
+        run: |
+          mkdir -p /home/runner/.cloudflared
+          echo '${{ secrets.TUNNEL_CREDENTIALS }}' > /home/runner/.cloudflared/dde4ddcb-208b-4ea4-af64-cb3c1ec1f5ae.json
+          printf '%s\n' \
+            "tunnel: dde4ddcb-208b-4ea4-af64-cb3c1ec1f5ae" \
+            "credentials-file: /home/runner/.cloudflared/dde4ddcb-208b-4ea4-af64-cb3c1ec1f5ae.json" \
+            "ingress:" \
+            "  - hostname: cloud.juro5000.me" \
+            "    service: http://localhost:5050" \
+            "  - service: http_status:404" > /tmp/tunnel-config.yml
+          nohup cloudflared tunnel --config /tmp/tunnel-config.yml run > /tmp/cloudflared.log 2>&1 &
+          sleep 3
+          echo "cloudflared started"
+
+      - name: Run bot
+        if: steps.health.outputs.skip != 'true'
+        env:
+          MC_REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+          MC_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          MC_XBL_TOKEN: ${{ secrets.XBL_TOKEN }}
+          MC_XBL_USER_HASH: ${{ secrets.XBL_USER_HASH }}
+        run: |
+          echo "Starting jurobot for $BOT_DURATION hours..."
+          echo "Web panel: https://cloud.juro5000.me/panel"
+          echo "Health: https://cloud.juro5000.me/api/health"
+          timeout $((${BOT_DURATION} * 3600)) ./jurobot -u ${{ secrets.BOT_USERNAME }}
+          echo "Bot run completed or timed out"
+
+      - name: Stop cloudflared
+        if: always()
+        run: pkill cloudflared 2>/dev/null || true
+
+      - name: Upload logs
+        if: always() && steps.health.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-logs-${{ github.run_number }}
+          path: |
+            *.log
+          retention-days: 7

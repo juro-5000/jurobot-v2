@@ -1,0 +1,25 @@
+{
+  "roles": {
+    "owner": {
+      "commands": ["pull", "role", "ban", "unban", "end", "inv", "list", "help"]
+    },
+    "admin": {
+      "commands": ["role", "end", "inv", "list", "help"]
+    },
+    "trusted": {
+      "commands": ["end", "inv", "list", "help"]
+    },
+    "pull": {
+      "commands": ["pull", "inv", "list", "help"]
+    },
+    "member": {
+      "commands": ["inv", "list", "help"]
+    }
+  },
+  "users": {
+    "Juro5000": ["owner"],
+    "Ruby81925": ["member"],
+    "TidierLeek3903": ["member"]
+  },
+  "banned": []
+}
